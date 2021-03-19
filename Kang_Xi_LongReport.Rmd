@@ -1,0 +1,1036 @@
+---
+title: "Long Report"
+author: "XI KANG"
+date: "3/4/2021"
+output:
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+    highlight: "tango"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Final Project Long Report
+
+This is the comprehensive long report for the final project of Stat 301-2. It contains all essential contents of the final project separated into four sections: the introduction of data and research questions, the exploratory data analysis, data modeling, and conclusion. 
+<br>
+
+```{r load-packages-set-seed}
+# Load Packages
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(tidymodels)
+library(corrplot)
+library(lubridate)
+library(lares)
+library(corrr)
+library(kableExtra)
+library(naniar)
+library(embed)
+
+# set seed
+set.seed(42)
+```
+
+
+## Introduction
+
+### Dataset Overview
+
+The project uses the dataset "[**COVID-19 Reported Patient Impact and Hospital Capacity by State Timeseries**](https://healthdata.gov/Hospital/COVID-19-Reported-Patient-Impact-and-Hospital-Capa/g62h-syeh)". This dataset documents the COVID-19 related patient impact and hospital utilization as state-specific timeseries from 2020-01-01 to 2021-02-27. The dataset is obtained from [Data.gov](https://www.data.gov). The URL to the original data source is linked with the dataset name. 
+
+*Note: The dataset is aggregated on a daily basis, and the version with dates ending at 2021-02-27 was the most recent version when the dataset was downloaded for this project. Thus, the link provided might be outdated with the most current version of the dataset. *
+
+The original dataset has 19520 rows, representing 19520 unique date and state combinations. There are 60 columns in the original dataset, representing 60 variables. The first column, `state` is a character type variable, and it represents the two digit state code. The second column is the date in `ymd` form. The remaining 58 variables are all numeric variables, such as `critical_staffing_shortage_today_not_reported` and `inpatient_beds_coverage`. They convey information regarding the capacity and utilization of the medical system and the patient impacts.
+
+### Research Questions
+
+The ongoing COVID-19 pandemic has caused excess deaths and significant decline in life expectancy for the worldwide population. The pandemic has posed unprecedented challenges to the worldwide health systems. In particular, the United States is among the countries that are most affected by the pandemic. The stress on the health system leads to poor outcomes, such as high mortality and morbidity rates.[1] Thus, understanding the trends in hospital utilization and being able to predict future shortages are important for better resource management to reduce the inpatient mortality and morbidity that are caused either directly or indirectly by COVID-19.
+<br>
+
+Following the incentives above, my research question is to create a regression model to predict the number of hospitals having (reporting to have) a critical staffing shortage in a specific state at a given date based on the information regarding the current condition of COVID-19 related patient impact and hospital utilization in that state. The response variable is `critical_staffing_shortage_today_yes` - the number of hospitals reporting that they have a critical staffing shortage on the given day in a specific state. 
+<br>
+
+## Exploratory Data Analysis
+
+### Load Data
+
+I first loaded in the unprocessed dataset, cleaned the names, and obtained an overview with the [dataset API online](https://dev.socrata.com/foundry/healthdata.gov/g62h-syeh) and the interactive viewer: 
+```{r}
+# load in dataset
+covid_data <- 
+  read_csv("data/unprocessed/reported_hospital_utilization_timeseries_20210227_1306.csv") %>%
+  clean_names()
+```
+<br>
+
+### Initial Tidying
+
+Through initial inspection using the `skim()` function and the interactive viewer, I learned that the initial dataset has 60 variables. The data dictionary provided with the data source indicates that there are variables with repeated information. For instance, variables with name ending with `_numerator` and `_demoninator` are used to compute variables starting with `percent_` or ending with `_utilization`. A specific example can be `inpatient_beds_utilization_numerator`, `inpatient_beds_utilization_denominator`, and `inpatient_beds_utilization`. 
+<br>
+
+Also, some variables are by meaning not suitable to be used as predictors for my research question. First, by definition, variables `critical_staffing_shortage_today_no` (number of hospitals reporting as not having a critical staffing shortage today in this state) and `critical_staffing_shortage_today_not_reported` (number of hospitals not reporting staffing shortage today status in this state) should be known at the same time with the outcome variable `critical_staffing_shortage_today_yes`. If we know `critical_staffing_shortage_today_yes`, we can also know the values of `critical_staffing_shortage_today_no` and `critical_staffing_shortage_today_not_reported` through linear combination based on the total number of reports received and the number of hospitals in the state from open online resources. Thus, it does not make sense to use `critical_staffing_shortage_today_no` and `critical_staffing_shortage_today_not_reported` as predictors. Also, since the aim of this research project is to predict the situation of critical staff shortage in the future, variables starting with `critical_staffing_shortage_anticipated_within_week` (number of hospitals anticipating / not anticipating to have staff shortage within a week) are more suitable to be used as potential response variables rather than predictors. Also, these variables are time lagged with the other variables, and the time range "within a week" is quite ambiguous in the given definitions from the dataset API (can be from 1 to 7 days). Thus, I chose to not include variables starting with `critical_staffing_shortage_anticipated_within_week` as predictors. Before further data analysis, I filtered out variables that are not going to be used as predictors from the dataset.
+<br>
+
+```{r}
+# filter out "disqualified" predictors
+covid_data <- 
+  covid_data %>% 
+  select(-ends_with(c("_numerator", "_denominator",
+                      "_no", "_not_reported", "within_week_yes")))
+
+```
+<br>
+
+After filtering, 45 variables are left in the dataset including the potential outcome variable `critical_staffing_shortage_today_yes`. 
+
+### Correlation
+
+Before examining the missing data, I explored the correlations between variables for selecting predictors. I created a correlation matrix using methods from the `corrplot` package. Since `state` will definitely be used as a predictor, and it is not numeric, I did not include it in the analysis of correlations. Also, since the dataset is a time series, `date` is a variable of special focus. Its correlation with the response variable is explored individually in the "Exploring Timeseries" section. To avoid problems caused by missing data, I filtered out rows with `NA` values when creating the correlation matrix The code for creating the correlation matrix is presented below: 
+```{r}
+# create correlation matrix
+corr_matrix_tot <- covid_data %>% 
+  # unselect non-numeric type variables
+  select(-c(state, date)) %>% 
+  # remove rows with missing data
+  drop_na() %>%
+  cor()
+```
+<br>
+
+#### Predictor Selection
+
+To determine whether all 44 variables should be used as predictors, I explored the correlation between each variable and the response variable `critical_staffing_shortage_today_yes` by extracting the corresponding row (the first row), pivoting it to be longer, and arranging the correlation coefficients in descending order. For presentation of the results, I formatted it into a scrollable box using methods from the `kableExtra` package. To check whether there are variables with near perfect collinearity with the response variable that will cause problem in the later modeling process, I also showed the number of rows with greater than 0.9 correlation coefficients. 
+```{r}
+# correlations with response variable
+# arrange in ascending order of correlation coefficient
+corr_response <- corr_matrix_tot %>% 
+  as_tibble() %>% 
+  # select the column showing the correlation with the outcome var
+  head(1) %>% 
+  # pivoting, make a character column of variables' names
+  # and a numeric column of values of the correlation coefficients
+  pivot_longer(everything(), 
+               names_to = "variable", values_to = "correlation") %>%
+  arrange(desc(correlation))
+
+# show the correlation with the response variable in a scrollable box
+kbl(corr_response) %>%
+  kable_paper() %>%
+  scroll_box(width = "100%", height = "200px")
+
+
+# number of variables with relatively weak correlations with the outcome
+corr_response %>% 
+  filter(correlation >= 0.9) %>% 
+  nrow()
+```
+<br>
+
+As shown above by the tibble, only one variable has perfect correlation coefficient - the response variable itself. Thus, there is no predictor variables with near perfect correlation with the response variable. The variables most correlated with the outcome variable have correlation coefficient around 0.82. 
+<br>
+
+#### Correlation between Predictors
+
+After examining the correlation with the response variable, I continued to investigate the correlations between the predictors.
+<br>
+
+To focus on the correlations between predictors, I excluded the outcome variable `critical_staffing_shortage_today_yes` and temporarily turned the non-numeric type variables `state` and `date` into numeric type variables. Afterwards, I used methods from the `corrr` package to show the correlations between the predictors. To do so, I first created a correlation matrix with the `correlate()` method from the `corrr` package. Then, I turn it into a tibble. Later, I arranged the valid answers in descending order of the `correlation` variable value - representing the correlation coefficient. Also, for the convenience of presentation and exploration, I filtered out rows with `NA` `correlation` values. Since the even rows (row 2, row 4, etc.) just repeat the information in the previous odd rows with the order of the two variables reversed, I removed the even rows from the resulting tibble. Same as above, I presented the results as a scrollable box.
+```{r}
+# correlations between predictors
+corr_pred <- covid_data %>% 
+  # unselect outcome variable
+  select(-c(critical_staffing_shortage_today_yes)) %>% 
+  # temporarily change `state` and `date` to type numeric
+  mutate(date = as.numeric(date),
+         # first turn state into a factor
+         # then turn it into a numeric variable
+         # with values determined by factor levels
+         state = as.numeric(as.factor(state))) %>%
+  # remove rows with missing data
+  drop_na() %>%
+  # correlation matrix
+  correlate() %>% 
+  # turn into a tibble
+  stretch() %>% 
+  rename("correlation" = "r") %>% 
+  # remove rows with invalid result
+  # the `NA` values are the correlation of one var with itself
+  # in this case
+  filter(!is.na(correlation)) %>% 
+  # arranging in descending order
+  arrange(desc(correlation))
+
+# remove even rows
+# they just repeat the info of the odd rows above them
+corr_pred <- corr_pred %>% 
+  # temporary var `row_id` to help the removing process
+  mutate(row_id = row_number()) %>% 
+  # filter out even rows
+  filter(!row_id %% 2 == 0) %>% 
+  # remove temporary var
+  select(-row_id)
+
+# show the correlations between predictors in a scrollable box
+kbl(corr_pred) %>%
+  kable_paper() %>%
+  scroll_box(width = "100%", height = "200px")
+```
+<br>
+
+From the results, I noticed that many of the predictors have near perfect collinearity. I filtered out predictor pairs with the absolute value of correlation coefficients above 0.90. The tibble containing all distinct predictor pairs with near perfect collinearity is printed below:
+```{r}
+# explore collinearity
+near_perfect_collinearity <- corr_pred %>% 
+  filter(abs(correlation) > 0.90)
+
+near_perfect_collinearity %>% 
+  kbl() %>%
+  kable_paper() %>% 
+  scroll_box(width = "100%", height = "200px") %>% 
+  kableExtra::footnote(general = 
+                         "independent variable pairs with near perfect collinearity")
+```
+<br>
+
+Shown by the resulting tibble after filtering, the many of the variable pairs with near perfect collinearity are between variables ending with `_coverage`. Checking the data dictionary, I learned that values of these variables represent the number of hospitals reporting the corresponding data in the state on the given date. Thus, it make sense for them to have a strong linear relation, since one hospital reporting one type of data is likely to also report other types of data at the same time. In fact, the different `_coverage` values are likely to be almost equal, shown by the example visualization between `inpatient_beds_used_coverage` and `inpatient_beds_utilization_coverage`: 
+```{r, fig.width = 7, fig.height = 7}
+# visualize relation btw different coverages
+covid_data %>% 
+  ggplot(aes(inpatient_beds_used_coverage, 
+             inpatient_beds_utilization_coverage)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE) + 
+  labs(
+    title = "Relation between Different Coverage Variables"
+  )
+```
+<br>
+
+In the plot, the diagonal fitted line confirms the near perfect collinearity. 
+<br>
+
+To verify the near perfect collinearity between all `_coverage` variables, I created the correlation plot below for all variables in the dataset ending with `_coverage` using methods from the `corrplot` package. This plot provides a general view on the degrees of inter-variables correlations for all predictors in `covid_data` ending with `_coverage` instead of focusing on the correlation between any specific set of variables. Thus, I used indexed strings matching column position of each variable (`X1`, `X2`, etc.) as the temporary variable names in this plot, avoiding the spacing problem caused by long variable names. 
+```{r, fig.width = 7, fig.height = 7}
+# correlation plot between all numeric predictors
+# vector for the temporary column names
+temp_col_names <- 
+  # indexed strings
+  paste(c("X"), 1:21, sep="")
+
+covid_data %>% 
+  # select only numeric predictors
+  select(ends_with("_coverage")) %>% 
+  # temporarily rename all columns to indexed strings
+  rename_all(~ temp_col_names) %>% 
+  drop_na() %>% 
+  # compute correlation matrix
+  cor() %>% 
+  # visualize
+  corrplot(type = "upper", 
+           title = "Correlations between Variables Ending with `_coverage`", 
+           mar = c(0, 0, 1, 0))
+```
+<br>
+
+As shown, the universally observed dark blue circles verifies the near perfect collinearity. I decided to remove predictor variables with near perfect collinearity to avoid potential problems in statistical learning and to simplify the dataset for the later process. I kept only `inpatient_beds_coverage` and removed all other predictor variables ending with `_coverage`: 
+```{r}
+covid_data <- covid_data %>% 
+  # remove variables with near perfect collinearity
+  # only keep `inpatient_beds_coverage`
+  select(-c(ends_with("_coverage")), inpatient_beds_coverage)
+```
+<br>
+
+After removing the redundant `_coverage` variables, I checked again for any remaining collinearity between predictor variables in the dataset: 
+```{r}
+# remaining strong collinearity
+remain_near_perfect_collinearity <- covid_data %>% 
+  # unselect outcome variable
+  select(-c(critical_staffing_shortage_today_yes)) %>% 
+  # temporarily change `state` and `date` to type numeric
+  mutate(date = as.numeric(date),
+         # first turn state into a factor
+         # then turn it into a numeric variable
+         # with values determined by factor levels
+         state = as.numeric(as.factor(state))) %>%
+  # remove rows with missing data
+  drop_na() %>%
+  # correlation matrix
+  correlate() %>% 
+  # turn into a tibble
+  stretch() %>% 
+  rename("correlation" = "r") %>% 
+  # obtain rows with correlation greater than 0.90
+  filter(correlation > 0.9) %>% 
+  arrange(desc(correlation))
+
+# show tibble
+kbl(remain_near_perfect_collinearity) %>%
+  kable_paper() %>%
+  scroll_box(width = "100%", height = "200px")
+```
+<br>
+
+As shown, the remaining highly correlated predictor pairs are between variables starting with `previous_` or `total_` and between variables containing `_confirmed_and_suspected` or `_confirmed`. 
+<br>
+
+Shown by the visualization below, the value of confirmed and suspected cases show strong collinearity with the number of confirmed cases: 
+```{r, fig.width = 7, fig.height = 7}
+# visualize inter-variable correlations between predictors
+covid_data %>% 
+  ggplot(aes(total_adult_patients_hospitalized_confirmed_covid, 
+             total_adult_patients_hospitalized_confirmed_and_suspected_covid)) +
+  geom_point() + 
+  geom_smooth(se = FALSE) +
+  labs(
+    title =  "Relation Between Confirmed and Confirmed and Suspected Cases", 
+    x = "Confirmed Cases", 
+    y = "Confirmed and Suspected Cases"
+  )
+
+```
+<br>
+
+The collinearity makes sense, since for the same group of patients (i.e. adult or ICU patients), the number of confirmed COVID cases and the number of confirmed and suspected cases are likely to be linear combinations of each other. 
+<br>
+
+Moreover, the total confirmed COVID cases for each patient group has a strong positive relation with the previous day confirmed COVID cases, since one can be computed from another.
+<br>
+
+For example, `previous_day_admission_adult_covid_confirmed` has a direct linear relation with `total_adult_patients_hospitalized_confirmed_covid`: 
+```{r, fig.width = 7, fig.height = 7}
+# visualize inter-variable correlations between predictors
+covid_data %>% 
+  ggplot(aes(previous_day_admission_adult_covid_confirmed, 
+             total_adult_patients_hospitalized_confirmed_covid)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE) +
+  labs(
+    title =  "Relation Between Previous Day and Total Confirmed Cases", 
+    x = "Previous Day Confirmed Cases", 
+    y = "Total Confirmed Cases"
+  )
+``` 
+<br>
+
+Also, since `inpatient_beds_used_covid` is the total number of patients currently hospitalized in an inpatient bed who have suspected or confirmed COVID-19 in this state, it is the linear combination of the numbers of all groups of hospitalized patients who have suspected or confirmed COVID-19. Thus, it covers the information regarding `hospital_onset_covid` (the total current inpatients with onset of suspected or laboratory-confirmed COVID-19 fourteen or more days after admission for a condition other than COVID-19), `total_adult_patients_hospitalized_confirmed_and_suspected_covid` (the reported patients currently hospitalized in an adult inpatient bed who have confirmed or suspected COVID-19), `total_pediatric_patients_hospitalized_confirmed_and_suspected_covid` (the reported patients currently hospitalized in a pediatric inpatient bed who are suspected or laboratory-confirmed-positive for COVID-19), and `staffed_icu_adult_patients_confirmed_and_suspected_covid` (the reported patients currently hospitalized in an adult ICU bed who have suspected or confirmed COVID-19). 
+<br>
+
+For illustration of the relation, I presented the scatterplot for the relation between `inpatient_beds_used_covid` and the sum of `total_adult_patients_hospitalized_confirmed_and_suspected_covid` and `total_pediatric_patients_hospitalized_confirmed_and_suspected_covid`: 
+```{r, fig.width = 7, fig.height = 7}
+covid_data %>% 
+  mutate(
+    total_confirmed_and_suspected = 
+      total_adult_patients_hospitalized_confirmed_and_suspected_covid + 
+      total_pediatric_patients_hospitalized_confirmed_and_suspected_covid
+  ) %>% 
+  ggplot(aes(inpatient_beds_used_covid, 
+             total_confirmed_and_suspected)) +
+  geom_point() + 
+  geom_smooth(se = FALSE) + 
+  labs(
+    title =  "Inpatient Bed Usage and Confirmed and Suspected Cases", 
+    x = "Inpatient Bed Usage Related to COVID", 
+    y = "Confirmed and Suspected Cases"
+  )
+```
+<br>
+
+Thus, I decided to only keep variable `inpatient_beds_used_covid` as the holistic representation of the conditions of hospital usage related to COVID-19 and remove other redundant columns (variables containing `_covid`): 
+```{r}
+# remove redundant predictors
+covid_data <- covid_data %>% 
+  select(-contains("_covid"), inpatient_beds_used_covid)
+```
+<br>
+
+Also, `inpatient_beds` is highly correlated with `inpatient_beds_used`, `staffed_adult_icu_bed_occupancy`, and `total_staffed_adult_icu_beds`: 
+```{r, fig.width = 7, fig.height = 7}
+# visualize inter-variable correlations between predictors
+covid_data %>% 
+  ggplot(aes(inpatient_beds, 
+             inpatient_beds_used)) +
+  geom_point() + 
+  geom_smooth(se = FALSE) + 
+  labs(
+    title =  "Relation Between Total and Used Inpatient Beds", 
+    x = "Total Inpatient Beds", 
+    y = "Used Inpatient Beds"
+  )
+
+covid_data %>% 
+  ggplot(aes(inpatient_beds, 
+             total_staffed_adult_icu_beds)) +
+  geom_point() + 
+  geom_smooth(se = FALSE) + 
+  labs(
+    title =  "Relation Between Total Inpatient Beds and ICU Beds", 
+    x = "Total Inpatient Beds", 
+    y = "Staffed ICU Beds"
+  ) + 
+  xlim(0, 75000)
+```
+<br>
+
+The high correlation makes sense, since `inpatient_beds`, `inpatient_beds_used`, `staffed_adult_icu_bed_occupancy`, and `total_staffed_adult_icu_beds` all convey information about the general hospital resource capacity for a specific state at a given date. `inpatient_beds` (the reported total number of staffed inpatient beds including all overflow and surge/expansion beds used for inpatients (includes all ICU beds)) covers the information contained in `total_staffed_adult_icu_beds`. Moreover, the number of inpatient bed usage is related to the overall capacity of the hospital system. States with greater capacity has higher number of `inpatient_beds`, and they can admit more patients, leading to a higher number of `inpatient_beds_used`. Based on the observation, I kept variable `inpatient_beds` as an indicator of the overall hospital resource capacity in a state on a given date, and I removed the other variables having near perfect collinearity with `inpatient_beds`: 
+```{r}
+# remove redundant predictors
+covid_data <- covid_data %>% 
+  select(-c(`inpatient_beds_used`, `staffed_adult_icu_bed_occupancy`, 
+            `total_staffed_adult_icu_beds`))
+```
+<br>
+
+I then checked again for near perfect collinearity among the remaining predictors. I first created a tibble `corr_pred_remain` containing the correlation coefficients for the remaining predictors arranged in descending order. Then I filtered to see if there is any rows with the absolute value of the correlation coefficient greater than 0.9: 
+```{r}
+# remaining predictors correlations
+corr_pred_remain <- covid_data %>% 
+  # unselect outcome variable
+  select(-c(critical_staffing_shortage_today_yes)) %>% 
+  # temporarily change `state` and `date` to type numeric
+  mutate(date = as.numeric(date),
+         # first turn state into a factor
+         # then turn it into a numeric variable
+         # with values determined by factor levels
+         state = as.numeric(as.factor(state))) %>%
+  # remove rows with missing data
+  drop_na() %>%
+  # correlation matrix
+  correlate() %>% 
+  # turn into a tibble
+  stretch() %>% 
+  rename("correlation" = "r") %>% 
+  # arrange in descending order of correlation
+  arrange(desc(correlation))
+
+# show tibble
+kbl(corr_pred_remain) %>%
+  kable_paper() %>%
+  scroll_box(width = "100%", height = "200px")
+
+# check for correlation exceeding 0.9
+corr_pred_remain %>% 
+  filter(abs(correlation) > 0.9) %>% 
+  nrow()
+```
+<br>
+
+As shown above, there is no correlation values exceeding 0.9.
+<br>
+
+I also created a correlation plot for the remaining predictors and the outcome variable, temporarily turning `state` and `date` into numeric variables:
+```{r, fig.width = 8, fig.height = 8}
+# correlation plot between predictors
+covid_data %>% 
+  # temporarily change `state` and `date` to type numeric
+  mutate(date = as.numeric(date),
+         # first turn state into a factor
+         # then turn it into a numeric variable
+         # with values determined by factor levels
+         state = as.numeric(as.factor(state))) %>%
+  # remove rows with missing data
+  drop_na() %>% 
+  # compute correlation matrix
+  cor() %>% 
+  # visualize
+  corrplot(type = "lower", tl.srt = 45,  tl.cex = 0.5,
+           method = "circle", tl.col = 'black',
+           order = "hclust")
+```
+<br>
+
+As shown, there are a few strong correlations (above 0.8) between variables `inpatient_beds`, `inpatient_beds_used_covid`, and `inpatient_beds_coverage`, but there is no near perfect collinearity. Also, there is no strong direct relationship between the response variable and some of the predictors.  
+<br>
+
+### Missing Values
+
+After determining the set of predictors, I look at the missing values. During initial inspection using `skimr` functions, I learned that the outcome variable, `critical_staffing_shortage_today_yes`, does not have any missing data. To start the analysis of missing data, I provided a visualization of the overall situation of missingness in the dataset after determining the set of predictors: 
+```{r, fig.width = 9, fig.height = 8}
+# overview of the missingness situation
+covid_data %>% 
+  vis_miss(cluster = TRUE)
+```
+<br>
+
+As shown, after filtering, there are 8 variables in the dataset including the outcome variable. While many variables have near 100% completion rate, variable `adult_icu_bed_utilization` has around 38% missing values. 
+<br>
+
+I also visualized the distribution of percentage of missingness among the predictors. To do so, I first obtained a tibble of the numerical summaries for missing data in `covid_data` using `miss_var_summary()`. Then I created a histogram for the distribution of `pct_miss`.
+```{r}
+# summary for missing data for predictors
+pred_miss_summary <- covid_data %>% 
+  select(-critical_staffing_shortage_today_yes) %>% 
+  miss_var_summary()
+
+# visualize the distribution of percentage of missing values 
+pred_miss_summary %>% 
+  ggplot(aes(pct_miss)) + 
+  # add histogram
+  geom_histogram() +
+  labs(
+    x = "Percent Missing",
+    title = "Distribution of the Percentage of Missingness"
+  )
+```
+<br>
+
+As shown, most variables have close to 100% completion rate. Also, no variable has missing rate above 40%, which allows them to convey a valuable amount of information. Thus, there is no need to exclude any variables in the later analysis due to severe missingness. I initially hypothesized that the missing data might represent a value of 0. However, the dataset dictionary and observations from the initial inspection indicate that `NA` values and explicit 0 values are not equivalent for this dataset. Also, the dataset dictionary suggests that "no statistical analysis is applied to account for non-response and/or to account for missing data". Thus, for the convenience of later analysis, I chose to filter out observations with missing values. 
+```{r}
+# remove rows containing NA values
+covid_data <- covid_data %>% 
+  drop_na()
+```
+<br>
+
+### Exploring Timeseries - the `date` Variable
+
+Since the dataset is considered as a timeseries, the `date` variable is an important focus of the analysis. The exploration in this section aims to determine the time range of the data used for modeling and relation between `date` and the outcome variable of the prediction. 
+
+#### Determine Time Range
+
+Since the situations regarding the trends of confirmed and suspected cases and the patterns in medical resource usage change rapidly overtime, including data from very early days might not be very valuable for the later statistical learning process. Thus, I chose to include only the most recent observations. During initial skimming, I noticed that the more distant times have fewer complete observations. Thus, I chose to exclude observations from the earlier period of time that has significantly fewer complete observations than the later times. To determine the "cutting point" for the time range of the observations to be used, I count the number of observations at each date after removing rows with missing data. The visualization is shown below: 
+```{r}
+# visualize the distribution of valid observations overtime
+covid_data %>% 
+  ggplot(aes(date)) + 
+  geom_histogram() + 
+  labs(
+    title = "Number of Observations at Each Date"
+  )
+```
+<br>
+
+As shown, the dates before August 2020 have significantly less number of observations. Matching the observations from initial skimming, these dates are also more distant dates, I chose to not include them in the later modeling. From now on, the observations in the dataset are on dates later than 2020-08-01. 
+```{r}
+# filter out dates
+covid_data <- covid_data %>% 
+  filter(date >= "2020-08-01")
+```
+<br>
+
+I also examined the relation between the outcome variable and date to see whether there is straight linear relation between them: 
+```{r, fig.width = 7, fig.height = 7}
+# relation between response variable and `date`
+covid_data %>% 
+  ggplot(aes(date, critical_staffing_shortage_today_yes)) + 
+  geom_point() + 
+  labs(
+    title = "Relation between the Response Variable and Date", 
+    subtitle = "critical_staffing_shortage_today_yes",
+    x = "Date", 
+    y = "Hospitals with Critical Staffing Shortages"
+  )
+```
+<br>
+
+The absence of any obvious linear pattern suggests that there `date` does not have a straight-linear relation with the outcome variable. 
+
+### Categorical Variable
+
+I also inspected the categorical predictor `state` to determine whether it is necessary to alter factor levels before encoding: 
+```{r, fig.width = 7, fig.height = 7}
+# visualize distribution of `state`
+covid_data %>% 
+  ggplot(aes(y = state)) + 
+  geom_bar() + 
+  xlim(0, 250) + 
+  labs(y = NULL, 
+       title = "Number of Observations for Different State")
+```
+<br>
+
+As shown, the number of observations in all 52 levels of `state` are evenly distributed. However, since the large number of levels might lead to high dimensionality and a sparse matrix when encoding, I chose to collapse it into regions. From now on, the `state_region` variable represents the region where the state is located according to the common way of referring to regions in the United States by grouping them into 5 regions according to their geographic position on the continent (the Northeast, Southwest, West, Southeast, and Midwest). The way of classifying the regions is obtained on the [National Geographic's website](https://www.nationalgeographic.org/maps/united-states-regions/). I put "DC" (capital), "VI" (Virgin Islands), "PR" (Puerto Rico), and "HI" (Hawaii) into the `other` category. 
+```{r}
+# collapsing `state` levels to regions
+covid_data <- covid_data %>% 
+  mutate(state = 
+           fct_collapse(state, "Northeast" = c("ME", "VT", "NH", "MA", 
+                                               "NY", "RI", "CT", "NJ", "PA"), 
+                        "Midwest" = c("ND", "SD", "MN", "WI", "MI", "IA", 
+                                      "IL", "IN", "OH", "NE", "KS", "MO"), 
+                        "Southeast" = c("MD", "DE", "WV", "VA", "KY", "TN", 
+                                        "NC", "SC", "GA", "AL", "MS", "AR",
+                                        "LA", "FL"), 
+                        "Southwest" =c("AZ", "NM", "TX", "OK"), 
+                        "West" = c("AK", "WA", "OR", "MT", "ID", 
+                                   "WY", "CA", "NV", "UT", "CO"), 
+                        "other" = c("PR", "VI", "DC", "HI"))) %>% 
+  rename(state_region = state)
+```
+
+### Response Variable
+
+I then visualized the distribution of the output variable: 
+```{r, fig.width = 8, fig.height = 6}
+# visualize outcome var
+covid_data %>% 
+  ggplot(aes(critical_staffing_shortage_today_yes)) + 
+  geom_histogram() + 
+  labs(
+    title = "Distribution of Response Variable", 
+    subtitle = "critical_staffing_shortage_today_yes",
+    x = "Number of Hospitals Reporting Critical Staff Shortage"
+  )
+```
+<br>
+
+The response variable is right-skewed, meaning that there are more observations with smaller number of hospitals having a critical staff shortage than observations with very large number of hospitals having a critical staff shortage. The skewness leads me to consider using stratified sampling in the later splitting and also log-transform it. I replaced the original variable `critical_staffing_shortage_today_yes` with a new variable `critical_shortage_log`, obtained through log-transformation using base 10. From this point on, the outcome variable is `critical_shortage_log`, the log-transformed number of hospitals having a critical staffing shortage in a state at a given date: 
+```{r}
+# log-transform outcome var
+covid_data <- covid_data %>% 
+  mutate(
+    critical_shortage_log = 
+      log10(critical_staffing_shortage_today_yes + 0.00000001)
+  ) %>% 
+  select(-critical_staffing_shortage_today_yes)
+```
+
+<br>
+
+### Store Processed Data
+
+After finalizing the tidying and exploration, I stored the processed dataset as a `.rds` file in the processed folder (the code for this process is shown below with `eval` set to `FALSE`): 
+```{r, eval = FALSE}
+# store processed data
+covid_data %>% 
+  write_rds("data/processed/covid_data.rds")
+```
+<br>
+
+### Section Summary - EDA
+
+The Exploratory Data Analysis (EDA) section examines the key features and patterns in the original unprocessed dataset for data tidying, predictor selection, and gathering information that facilitates the later modeling process.
+<br>
+
+The EDA section explores the correlation between variables, analyzes the missing data, narrows down the time range of the observations used for modeling, and visualizes the distribution of the response variable. 
+<br>
+
+Through the exploration, 7 variables from the original dataset are selected as predictors and rows with `NA` values are removed. The skewness of the outcome variable implies the need for stratified sampling and log-transformation. The original variable `critical_staffing_shortage_today_yes` was log-transformed to obtain a new variable `critical_shortage_log`, the log-base-10-transformed number of hospitals having a critical staffing shortage in a state at a given date, as the new response variable for the later process. 
+<br>
+
+The tidied tibble containing the outcome variable and the 7 predictors are stored in the "processed" folder inside "data". Among the predictors, one is categorical (`state_region`), one is date (`date`), and the rest are numeric. Since `date` is used as a predictor, time split with stratification on the outcome variable will be applied in the later modeling process.  
+<br>
+
+## Predictive Modeling
+
+### Predictive Goal and Models of Interest
+
+The goal of the prediction is regression, and the outcome variable is `critical_shortage_log`, the log-transformed number of hospitals having critical staffing shortage in a state on a specific date. 
+<br>
+
+**Four competing model types** were trained and tuned:
+
+1.  A random forest model (`rand_forest()`) with the `ranger` engine;
+2.  A boosted tree model (`boost_tree()`) with the `xgboost` engine;
+3.  A *k*-nearest neighbors model (`nearest_neighbors()`) with the `kknn` engine; 
+4.  A elastic net regression model (`linear_reg()`) with the `glmnet` engine. 
+<br>
+
+### Load Data
+
+I first loaded in the processed data:
+```{r load-processed-data}
+# load data
+covid_data <- 
+  read_rds("data/processed/covid_data.rds")
+```
+
+### Split Data and Cross-Validation
+
+I chose to split the data into 70% training, 30% testing using initial time split with stratified sampling by the outcome variable `critical_shortage_log`.
+
+```{r}
+# split data
+covid_data <- initial_time_split(covid_data, prop = 0.7, 
+                                 strata = critical_shortage_log)
+# obtain training and test sets
+covid_train <- training(covid_data)
+covid_test <- testing(covid_data)
+```
+<br>
+
+I then verified that the training and testing data sets had the appropriate number of observations:
+```{r}
+# verify dimensions
+dim(covid_train)
+11183 * 0.7
+
+dim(covid_test)
+11183 * 0.3
+```
+<br>
+
+As shown, the number of rows in the training (7828) and test (3355) sets are consistent with the numbers gained when multiplying the total number of observations in `covid_data` (11183) by their relative proportions (0.7 and 0.3). 
+<br>
+
+Afterwards, I did the V-fold cross-validation with 10 folds, repeated 5 times, to fold the **training** data: 
+```{r}
+covid_folds <- 
+  vfold_cv(data = covid_train, v = 10, repeats = 5)
+```
+<br>
+
+### Second Round EDA - Inspection on the Training Set
+
+After splitting, I explored the key features of the training set for determining the steps to add when creating the recipe. The EDA section log-transformed the response variable to avoid potential issues caused by right-skewness. Here, the inspection on the training set indicates that variables `inpatient_beds`, `inpatient_beds_coverage`, and `inpatient_beds_used_covid` are also right-skewed. `adult_icu_bed_utilization` is about normal but slightly left-skewed, `inpatient_beds_utilization` is about normal.
+```{r, fig.width = 8, fig.height = 8}
+# distribution of all numeric variables
+covid_train %>% 
+  select(-c(state_region, date, 
+            critical_shortage_log)) %>% 
+  # Convert to key-value pairs
+  gather() %>% 
+  ggplot(aes(value)) + 
+  # faceting
+  facet_wrap(~ key, scales = "free") + 
+  geom_histogram() + 
+  labs(
+    title = "Distribution of All Numeric Predictors", 
+    subtitle = "Using Training Set Data"
+  )
+```
+<br>
+
+The observed skewness led me to consider using `step_log()` on variables `inpatient_beds`, `inpatient_beds_coverage`, and `inpatient_beds_used_covid` in creating the recipe. 
+<br>
+
+In addition, I explored the distribution of the levels of `state_region` to determine whether it is necessary to apply `step_other()` in creating the recipe.
+```{r}
+covid_train %>% 
+  ggplot(aes(y = state_region)) + 
+  geom_bar()
+```
+<br>
+
+As shown, regions `other` and `Southwest` have less than half the numbers of observations of the other regions. Thus, I chose to put the observations in these levels into a "Southwest_and_other" category using `step_other()` in making the recipe. 
+
+### Recipe
+
+I then set up a recipe to predict `critical_shortage_log` with all other variables in the dataset. Due to skewness, I log-transformed `inpatient_beds`, `inpatient_beds_coverage`, and `inpatient_beds_used_covid` using `step_log()`. To avoid problems caused by 0 values, I set `offset` to 0.0000001. I put the infrequently occurring values of `state_region` into an "Southwest_and_other" category and one-hot encoded this categorical predictor. In addition, I applied `step_date()` on `date`. Afterwards, I removed the original `date` column using `step_rm()`. Then, I standardized all predictors using `step_center()` and `step_scale()`.  
+<br>
+
+Since I plan to use tree-based models, I `prep()` and `bake()` the recipe on the training data to determine the upper limit for the possible values of `mtry`.
+
+```{r}
+covid_recipe <- 
+  recipe(critical_shortage_log ~ ., 
+         data = covid_train) %>% 
+  # log-transform all numeric predictors
+  step_log(c(inpatient_beds, inpatient_beds_coverage, 
+             inpatient_beds_used_covid), offset = 0.0000001) %>% 
+  step_other(state_region, threshold = 1000, 
+             other = "Southwest_and_other") %>% 
+  step_date(date, features = "doy") %>% 
+  step_rm(date) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>% 
+  # center and scale all predictors
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+  
+# `prep()` and `bake()` recipe on the training data
+prep(covid_recipe) %>% 
+  bake(new_data = NULL) %>% 
+  # show the number of columns to determine upper limit for `mtry`
+  ncol()
+```
+<br>
+
+When `prep()` and `bake()` the recipe on the training data, there are 12 columns in the data after processing, indicating the upper limit of `mtry` should be no greater than 11. 
+<br>
+
+### Model Fitting
+
+This section assesses the performance of different models for the prediction problem of this project. It tuned and trained four model types: 
+
+1.  A random forest model (`rand_forest()`) with the `ranger` engine;
+2.  A boosted tree model (`boost_tree()`) with the `xgboost` engine;
+3.  A *k*-nearest neighbors model (`nearest_neighbors()`) with the `kknn` engine;
+4.  A elastic net regression model (`linear_reg()`) with the `glmnet` engine. 
+<br>
+
+#### Set up Models and Flag Tuning Parameters
+
+For the random forest model, I tuned the hyper-parameters `mtry` and `min_n`. For the boosted tree model, I tuned `mtry`, `min_n`, and `learn_rate`. For the *k*-nearest neighbors model, I tuned `neighbors`. For the elastic net regression model, I tuned `penalty` and `mixture`. The codes below set up the models and flagged the parameters for tuning.  
+```{r}
+# train and tune models
+# random forest model
+rf_model <- rand_forest(mode = "regression",
+                        min_n = tune(),
+                        mtry = tune()) %>% 
+  set_engine("ranger")
+
+# boosted tree model
+bt_model <- boost_tree(mode = "regression", 
+                       mtry = tune(), 
+                       min_n = tune(), 
+                       learn_rate = tune()) %>% 
+  set_engine("xgboost")
+
+# Nearest neighbors model
+nn_model <- nearest_neighbor(mode = "regression", 
+                             neighbors = tune()) %>% 
+  set_engine("kknn")
+
+# elastic net regression model
+elastic_net_reg_model <- linear_reg(penalty = tune(), 
+                                    mixture = tune()) %>% 
+  set_engine("glmnet")
+```
+<br>
+
+#### Grid for Tuning
+
+I then set up and store **regular grids** with 5 levels of possible values for tuning hyper-parameters for each of the four models. For `mtry`, I used `update()` to change the upper limit value to the number of predictor columns. For `learn_rate`, I set `range = c(-1, 0)`. I set the range of `neighbors` to be `c(1L, 25L)`. I used default tuning parameters for parameters `min_n`, `mixture`, and `penalty`.
+```{r}
+# random forest model
+rf_params <- parameters(rf_model) %>% 
+  update(mtry = mtry(range = c(1, 11)))
+# store regular grid
+rf_grid <- grid_regular(rf_params, levels = 5)
+
+# boosted tree model
+bt_params <- parameters(bt_model) %>% 
+  update(mtry = mtry(range = c(1, 11)), 
+         learn_rate = learn_rate(range = c(-1, 0)))
+# store regular grid
+bt_grid <- grid_regular(bt_params, levels = 5)
+
+# Nearest neighbors model
+nn_params <- parameters(nn_model) %>% 
+  update(neighbors = neighbors(range = c(1L, 25L)))
+# store regular grid
+nn_grid <- grid_regular(nn_params, levels = 5)
+
+# elastic net regression model
+elastic_net_params <- parameters(elastic_net_reg_model)
+# store regular grid
+elastic_net_grid <- grid_regular(elastic_net_params, levels = 5)
+```
+
+#### Workflow
+
+Afterwards, I set up a workflow for each of the 4 competing models (random forest, boosted tree, knn, and elastic net regression): 
+```{r}
+# random forest model
+rf_workflow <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(covid_recipe)
+
+# boosted tree model
+bt_workflow <- workflow() %>% 
+  add_model(bt_model) %>% 
+  add_recipe(covid_recipe)
+
+# Nearest neighbors model
+nn_workflow <- workflow() %>% 
+  add_model(nn_model) %>% 
+  add_recipe(covid_recipe)
+
+# elastic net regression model
+elastic_net_workflow <- workflow() %>% 
+  add_model(elastic_net_reg_model) %>% 
+  add_recipe(covid_recipe)
+```
+<br>
+
+#### Tuning Parameters
+
+After setting up the workflow, I used the codes below to tune the parameters for the models and find the values that optimize model performance across folds for each of the workflows. The codes were run in separate R scripts, and the results were read-in using hidden R code chunks.
+```{r, eval=FALSE}
+# tune the parameters
+# random forest model
+rf_tuned <- rf_workflow %>% 
+  tune_grid(covid_folds, grid = rf_grid)
+
+# boosted tree model
+bt_tuned <- bt_workflow %>% 
+  tune_grid(covid_folds, grid = bt_grid)
+
+# Nearest neighbors model
+nn_tuned <- nn_workflow %>% 
+  tune_grid(covid_folds, grid = nn_grid)
+
+# elastic net regression model
+elastic_net_tuned <- elastic_net_workflow %>% 
+  tune_grid(covid_folds, grid = elastic_net_grid)
+```
+
+```{r, echo=FALSE}
+# read in results
+rf_tuned <- read_rds("results/rf_tune.rds")
+bt_tuned <- read_rds("results/bt_tune.rds")
+nn_tuned <- read_rds("results/nn_tune.rds")
+elastic_net_tuned <- read_rds("results/elastic_net_tune.rds")
+```
+<br>
+
+#### Tuning Results
+
+I then examined the results of tuning using `autoplot()` on each of the objects stored from the tuning and training step. I set the `metric` argument of `autoplot()` to `"rmse"` for each to explore the patterns in RMSE as the values of the tuning parameters change: 
+```{r}
+# checkout results
+# random forest model
+autoplot(rf_tuned, metric = "rmse")
+# boosted tree model
+autoplot(bt_tuned, metric = "rmse")
+# nearest neighbors model
+autoplot(nn_tuned, metric = "rmse")
+# elastic net regression model
+autoplot(elastic_net_tuned, metric = "rmse")
+```
+<br>
+
+As shown, for the random forest model, the RMSE value becomes significantly lower when `mtry`, the number of randomly selected predictors, is larger than 3 in the combinations with all different values of `min_n`, the minimal node size. For all parameters combinations, the RMSE value is the smallest when `mtry` is around 6 to 8. The combinations with the smaller `min_n` values (2 or 11) tends to produce lower RMSE across all different values of `mtry`. 
+<br>
+
+For the boosted tree model, the RMSE value tends to be smallest when `learn_rate` is slightly above 0.3 for all combinations. The smallest `min_n` value gives the lowest RMSE for each parameters combination. For all combinations, the RMSE value is the lowest when `mtry` is close to 1 or 9. 
+<br>
+
+For the nearest neighbors model, the RMSE value becomes significantly lower for `neighbors` greater than 5. The RMSE flattens around 0.87 afterwards, and it has the lowest RMSE when `neighbors` is around 14. The RMSE value shows a slight trend of increasing when `neighbors` gets above 20. 
+<br>
+
+For the elastic net regression model, the RMSE value flattens at about 1.60 for combinations with all different `penalty` values and `mixture` values close to 0. The RMSE value shows a significant increase when `mixture` gets close to 1 for all parameters combinations. Among them, the parameter combination with the lowest `penalty` (0.05) has the lowest RMSE value and slowest rate of increasing. 
+<br>
+
+#### Best Model and Optimal Parameters
+
+To determine the best performed model for the prediction problem of this project, I ran `show_best()` on each of the four tuned models to look for the smallest RMSE across cross-validation. I also examined the optimum value(s) for the best model's tuning parameters. Note, in the output tibble column `.config` is removed for spacing concerns. Also, the row showing the parameter set with the optimal RMSE values for each model is highlighted in blue: 
+```{r}
+# show rmse and select parameters based on best numerical performance
+# random forest model
+show_best(rf_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for Random Forest Model")
+
+# boosted tree model
+show_best(bt_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for Boosted Tree Model")
+
+# nearest neighbors model
+show_best(nn_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for k-Nearest Neighbors Model")
+
+# elastic net regression model
+show_best(elastic_net_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for Elastic Net Regression Model")
+```
+<br>
+
+As shown above, the random forest model produced the smallest RMSE across cross-validation. Here, the mean RMSE value of the best tuning parameters combination for the random forest model is 0.783, which is the lowest among the 4 models. Also, the standard error of its RMSE value is 0.01593507, and the difference between the mean RMSE of the best tuning parameters combination of the random forest model and the second lowest mean RMSE (the RMSE of the boosted tree model) is 0.052. Since the standard error of the random forest model's RMSE is much smaller than its difference with the second lowest mean RMSE, the random forest model model shows significantly better performance in producing the lowest bias on average. Thus, I concluded that the random model has performed the best. 
+<br>
+
+The optimum values for the random forest parameters are: `mtry` equals 8 and `min_n` equals 11. 
+<br>
+
+### Fit Entire Training Set
+
+I then fit the winning model to the entire training set: 
+```{r}
+rf_workflow_tuned <- rf_workflow %>% 
+  finalize_workflow(select_best(rf_tuned, metric = "rmse"))
+
+rf_results <- fit(rf_workflow_tuned, covid_train)
+```
+
+### Fit Testing Set
+
+To examine the chosen model's performance on the brand-new, untouched testing dataset, I used `predict()`, `bind_cols()`, and `metric_set()` to fit the tuned model to the `covid_test`. Since the scale of the outcome variable is log-transformed, I transformed it back to its original scale for better interpretation. 
+```{r}
+# create metric set
+covid_metric <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                      yardstick::rsq)
+
+# show result of prediction on testing data
+predict(rf_results, new_data = covid_test) %>% 
+  # change the predicted value from log-scale to original scale
+  mutate(
+    new_pred = round(10 ^ .pred)
+  ) %>% 
+  bind_cols(covid_test %>% select(critical_shortage_log)) %>% 
+  # transform from log-scale back to original scale
+  mutate(truth_obs = round(10 ^ critical_shortage_log)) %>%
+  covid_metric(truth = truth_obs, estimate = new_pred) %>% 
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+<br>
+
+As shown, the RMSE value is 9.47, meaning that when applying the model on the test set, the average bias is about 9 hospitals. This value is pretty high. The RMSE value measures the average squared difference between the estimated values and the actual value. Considering the extreme right-skewness of the outcome variable observed in the EDA section, the relatively high RMSE might be caused by several outliers with extreme values. The r-squared value is 0.8225, meaning that about 82.25% of the variation in the outcome can be explained by the model. The mae value is 4.753, suggesting that the average absolute differences between prediction and actual observations is about 4 or 5 hospitals. Even though the RMSE value is high, the relatively high r-squared value indicates the model's adequate performance in explaining the variances in the response variable. Thus, taken into consideration the impact of the possible presence of large outliers on the RMSE value and the good r-squared value, I concluded that the model's performance in making predictions using the test set is relatively adequate. 
+<br>
+
+
+### Summary and Future Direction
+
+#### Model Fitting Results
+
+In this project, four competing types of models are trained and tuned using cross-validation. In statistical learning or machine learning, we are generally interested in getting predictions with the lowest possible bias on average. Thus, I picked the method with optimal (lowest) RMSE value. Among the competing models, the random forest model (`rand_forest()`) with the `ranger` engine shows the lowest RMSE value with optimal parameters `mtry` equals 8 and `min_n` equals 11. Therefore, it was chosen to be the winning model.
+<br>
+
+The original dataset contains many outliers, and random forest is robust to outliers. Also, in the EDA section, I observed that some variables, especially `date`, did not have a straight-linear relation with the outcome variable. Also, `date` does not have a direct linear relation with other predictor variables. The non-linearity makes random forest a favorable model in comparison to the linear algorithms. In addition, the predictor `state_region` is categorical while other predictor variables are continuous. Since random forest works well with both categorical and continuous variables, it showed better performance in the situation of this problem. 
+<br>
+
+The predictions and truth values were transformed from log-base10 scale back to normal scale after fitting the winning model to the testing dataset for the ease of comparison and interpretation. The RMSE value is 9.47, meaning that the average bias is about 9 hospitals. The r-squared value is 0.8225, indicating that about 82.25% of the variation in the outcome variable can be explained by the model. The mae value is 4.753, suggesting that the average absolute differences between prediction and actual observations is about 4 or 5 hospitals.
+<br>
+
+The RMSE value is pretty high, considering the context that many true observations have values lower than 50 based on the visualization from the EDA section. The high RMSE might be caused by the presence of large outliers. Taken into account the relatively high r-squared value (82.25%), the model's performance in making predictions using on test set is mildly satisfactory, since it successfully explains a large proportion of the variances in the response variable, despite having a relatively high bias.   
+<br>
+
+
+#### Next Steps 
+
+Reading online documentation, I learned that random forest can automatically handle missing values. However, for this project, I removed all rows with `NA` values in the EDA section before model tuning. For further exploration on the models' performances, it might be helpful to not drop the `NA` values and access different model's performance in handling missing values.  
+<br>
+
+Also, even though the dataset is a time series, no obvious relation between `date` and any of the other variables in the dataset was observed in the EDA section. Thus, it might be interesting to run the predictions again without considering the effect of `date` on the outcome variable and compare the two results. This approach involves using `initial_split()` instead of `initial_time_split()`. 
+<br>
+
+Moreover, the `state` variable is collapsed into `state_region` to reduce the number of levels for the convenience of modeling. To access whether this change impacts a model's performance, future study can use feature hashing in creating the recipe for encoding the 52 levels of the `state` variable instead of collapsing them into regions. 
+<br>
+
+Lastly, the original outcome variable before log-transformation,  `critical_staffing_shortage_today_yes`, is a count variable that takes only positive whole number values. However, it does not have a finite set of values, since the total number of hospitals in each state region is different and hard to access. Thus, it cannot be treated as a multi-level categorical variable. From online resources, I learned that the count variables are best predicted by the poisson regression model. However, since this type of model is not yet covered in class, I treated the outcome variable as a numeric variable for the predictive modeling for this project. For future challenges, it might be helpful to do the prediction with a poisson regression model and compare its performance with the other models covered in this project. 
+<br>
+
+## Conclusion
+
+This project focuses on data modeling and analysis of the [**COVID-19 Reported Patient Impact and Hospital Capacity by State Timeseries**](https://healthdata.gov/Hospital/COVID-19-Reported-Patient-Impact-and-Hospital-Capa/g62h-syeh) dataset. The data contains information regarding the COVID-19 related patient impact and hospital utilization as state-specific timeseries from 2020-01-01 to 2021-02-27.
+<br>
+
+The goal of the project is to predict the number of hospitals reporting a critical staffing shortage in a state at a specific day (variable `critical_staffing_shortage_today_yes` in the original dataset), given its current situation regarding utilization of hospital resources and medical system capacity. 
+<br>
+
+The EDA section discovered the high collinearity between many predictor variables and the right-skewness of the outcome variable. Data tidying on the original dataset was used to reduce predictors with near perfect collinearity and to fix the problem of skewness in the outcome variable. 
+<br>
+
+The modeling section trained and tuned four types of models for regression prediction. Among them, the random forest model (`rand_forest()`) with the `ranger` engine shows the lowest RMSE value with optimal parameters `mtry` equals 8 and `min_n` equals 11, and it is chosen to be the winning model. The chosen model is then fit to the entire training set and the test set afterwards for final assessment of its performance. Using the testing set, the model has a RMSE value of 9.47, a r-squared value of 0.8225, and a mae value is 4.753. The model's performance in predicting the brand-new test set is adequate, despite having a relatively high RMSE value , since it successfully explains a large proportion of the variances in the response variable. 
+<br>
+
+Based on the results, observations, and limitations of the current project, future studies can be conducted to further access the impact of the `date` variable on the outcome, examine effects of changing the levels of the `state` variable, and explore the use of poisson regression in predicting count numbers. 
+
+## Citations
+
+1. Phelan AL, Katz R, Gostin LO. The Novel Coronavirus Originating in Wuhan, China: Challenges for Global Health Governance. JAMA. 2020 Feb 25;323(8):709-710. doi: [10.1001/jama.2020.1097](https://doi.org/10.1001/jama.2020.1097). PMID: 31999307.

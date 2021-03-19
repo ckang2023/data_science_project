@@ -1,0 +1,452 @@
+---
+title: "Executive Summary"
+author: "XI KANG"
+date: "3/17/2021"
+output: 
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+    highlight: "tango"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# Load Packages
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(tidymodels)
+library(corrplot)
+library(lubridate)
+library(lares)
+library(corrr)
+library(kableExtra)
+library(naniar)
+library(embed)
+library(xgboost)
+library(kknn)
+
+# set seed
+set.seed(42)
+
+# load in dataset
+covid_data <- 
+  read_csv("data/unprocessed/reported_hospital_utilization_timeseries_20210227_1306.csv") %>% 
+  clean_names()
+```
+
+# Project Overview
+
+## Dataset
+
+This project focuses on data modeling and analysis of the [**COVID-19 Reported Patient Impact and Hospital Capacity by State Timeseries**](https://healthdata.gov/Hospital/COVID-19-Reported-Patient-Impact-and-Hospital-Capa/g62h-syeh) dataset. The data contains information regarding the COVID-19 related patient impact and hospital utilization as state-specific timeseries from 2020-01-01 to 2021-02-27. <br>
+
+## Prediction Goal
+
+The research question of the project is to predict the number of hospitals reporting a critical staffing shortage in a state at a specific day (variable `critical_staffing_shortage_today_yes` in the original dataset), given the current situation regarding utilization of hospital resources and overall capacity of the medical system in that state. The type of prediction problem in this project is regression.\
+<br>
+
+# Sections and Highlights
+
+The main section of this project is divided into two sub-sections: the Exploratory Data Analysis (EDA) section and the Predictive Modeling section.
+
+## EDA Section
+
+The EDA section is inspired by the research question. It explores raw dataset to uncover possible patterns in the distribution of the outcome variable and its correlation with `date` and other numeric variables. It also examines the categorical variable and the correlations between the independent variables for selecting predictors and tidying the dataset. It has two major findings.
+
+### Finding 1: Near Perfection Collinearity between Independent Variables
+
+One major finding in the EDA section that helped narrowing down the scope of predictors is the high collinearity between many independent variables in the original dataset. The correlation matrix presented as a scrollable box below shows the near perfect collinearity between initial potential predictor variables in the dataset. Initially, there are 232 pairs of independent variables having correlation above 0.9 with each other:
+
+```{r correlation-matrix-tibble}
+# filter out "disqualified" predictors
+covid_data <- 
+  covid_data %>% 
+  select(-ends_with(c("_numerator", "_denominator",
+                      "_no", "_not_reported", "within_week_yes")))
+# correlations between predictors
+corr_pred <- covid_data %>% 
+  # unselect outcome variable
+  select(-c(critical_staffing_shortage_today_yes)) %>% 
+  # temporarily change `state` and `date` to type numeric
+  mutate(date = as.numeric(date),
+         # first turn state into a factor
+         # then turn it into a numeric variable
+         # with values determined by factor levels
+         state = as.numeric(as.factor(state))) %>%
+  # remove rows with missing data
+  drop_na() %>%
+  # correlation matrix
+  correlate() %>% 
+  # turn into a tibble
+  stretch() %>% 
+  rename("correlation" = "r") %>% 
+  # remove rows with invalid result
+  # the `NA` values are the correlation of one var with itself
+  # in this case
+  filter(!is.na(correlation)) %>% 
+  # arranging in descending order
+  arrange(desc(correlation))
+
+# remove even rows
+# they just repeat the info of the odd rows above them
+corr_pred <- corr_pred %>% 
+  # temporary var `row_id` to help the removing process
+  mutate(row_id = row_number()) %>% 
+  # filter out even rows
+  filter(!row_id %% 2 == 0) %>% 
+  # remove temporary var
+  select(-row_id)
+
+# explore collinearity
+near_perfect_collinearity <- corr_pred %>% 
+  filter(abs(correlation) > 0.90)
+
+near_perfect_collinearity %>% 
+  kbl() %>%
+  kable_paper() %>% 
+  scroll_box(width = "100%", height = "200px") %>% 
+  kableExtra::footnote(general = 
+                         "independent variable pairs with near perfect collinearity")
+```
+
+<br>
+
+It was observed that variables with near perfect collinearity have similar features in their names. For example, all variables ending with `_coverage` have a strong positive linear relation with each other, shown by the correlation plot below. *Note: the plot provides a general view on the degrees of inter-variables collinearity for all predictors in `covid_data` ending with `_coverage` instead of focusing on the correlation between any specific set of variables. Thus, I used indexed strings matching column position of each variable (`X1`, `X2`, etc.) as the temporary variable names in this plot, avoiding the spacing problem caused by long variable names.*
+
+```{r, fig.width = 7, fig.height = 7}
+# correlation plot between all numeric predictors
+# vector for the temporary column names
+temp_col_names <- 
+  # indexed strings
+  paste(c("X"), 1:21, sep="")
+covid_data %>% 
+  # select only numeric predictors
+  select(ends_with("_coverage")) %>% 
+  # temporarily rename all columns to indexed strings
+  rename_all(~ temp_col_names) %>% 
+  drop_na() %>% 
+  # compute correlation matrix
+  cor() %>% 
+  # visualize
+  corrplot(type = "upper", 
+           title = "Correlations between Variables Ending with `_coverage`", 
+           mar = c(0, 0, 1, 0))
+```
+
+<br>
+
+Further exploration on the variable definition showed that the high collinearity is due to the repetition of information among variables with different names. For example, all `_coverage` variables convey information about the scope of the survey in the state at a specific time, all variables containing `_covid` contain information regarding the COVID-19 related hospital resource usage, and all variables containing `_inpatient_beds` represent the overall capacity of a state's medical system. Based these observations, variables with near perfect collinearity were removed from the set of predictors to avoid redundant information and problems caused by collinearity between predictors in the later model training and tuning process. <br>
+
+After removing variables with repeated information, the number of variables in the dataset was reduced to 8, with one response variable and 7 predictors.
+
+### Finding 2: Extreme Right-Skewness in the Response Variable
+
+The second key finding of the EDA section is the extreme right-skewness of the outcome variable `critical_staffing_shortage_today_yes` shown by the plot below:
+
+```{r}
+# visualize outcome var
+covid_data %>% 
+  ggplot(aes(critical_staffing_shortage_today_yes)) + 
+  geom_histogram() + 
+  labs(
+    title = "Distribution of Response Variable", 
+    subtitle = "critical_staffing_shortage_today_yes",
+    x = "Number of Hospitals Reporting Critical Staff Shortage"
+  )
+```
+
+<br>
+
+Here, the response variable is right-skewed, meaning that there are significantly more observations with smaller number of hospitals having a critical staff shortage than observations with very large number of hospitals having a critical staff shortage. The skewness inspired the use of stratified sampling in the later data splitting and implied the need for log-transformation. To stabilize the variance, I replaced the original variable `critical_staffing_shortage_today_yes` with a new variable `critical_shortage_log`, obtained through log-transformation using base 10. Variable `critical_shortage_log`, the log-transformed number of hospitals having a critical staffing shortage in a state at a given date, is used as the outcome variable for the model training and tuning process.
+
+## Predictive Modeling Section
+
+The predictive modeling section trained and tuned 4 competing types of models:
+
+1.  A random forest model (\`rand_forest()\`) with the \`ranger\` engine;
+
+2.  A boosted tree model (\`boost_tree()\`) with the \`xgboost\` engine;
+
+3.  A \*k\*-nearest neighbors model (\`nearest_neighbors()\`) with the \`kknn\` engine.
+
+4.  A elastic net regression model (\`linear_reg()\`) with the \`glmnet\` engine. <br>
+
+The key steps in model training and tuning and the important parts of the results are presented below.
+
+### Data-Splitting and Cross-Validation
+
+The data was split into 70% training, 30% testing using initial time split with stratified sampling by the outcome variable `critical_shortage_log`.
+
+### Recipe Steps
+
+In creating the recipe, several steps were applied based on the observation on the training dataset.
+
+#### Log-Transformation
+
+Examining the distribution of the numeric predictors in the training set, variables `inpatient_beds`, `inpatient_beds_coverage`, and `inpatient_beds_used_covid` were observed to be significantly right-skewed, as shown in the plot below. Thus, `step_log()` was applied to these variables to stabilize the variance.
+
+```{r, fig.height = 8, fig.width = 8}
+# load data
+covid_data <- 
+  read_rds("data/processed/covid_data.rds")
+
+# split data
+covid_data <- initial_time_split(covid_data, prop = 0.7, 
+                                 strata = critical_shortage_log)
+# obtain training and test sets
+covid_train <- training(covid_data)
+covid_test <- testing(covid_data)
+
+covid_folds <- 
+  vfold_cv(data = covid_train, v = 10, repeats = 5)
+
+# distribution of all numeric variables
+covid_train %>% 
+  select(-c(state_region, date, 
+            critical_shortage_log)) %>% 
+  # Convert to key-value pairs
+  gather() %>% 
+  ggplot(aes(value)) + 
+  # faceting
+  facet_wrap(~ key, scales = "free") + 
+  geom_histogram() + 
+  labs(
+    title = "Distribution of All Numeric Predictors", 
+    subtitle = "Using Training Set Data"
+  )
+```
+
+<br>
+
+#### Infrequently Occuring Values
+
+When inspecting the categorical variable `state_region` in the training set, I noticed that the regions `other` and `Southwest` have less than half the numbers of observations of the other regions. To avoid situation of having some levels that are contained in the training set not present in the testing set, I chose to put the observations in these less-frequent levels into a "Southwest_and_other" category using `step_other()` in making the recipe.
+
+##### Recipe Steps Summary
+
+Below is the summary of the steps applied in creating the recipe:
+
+1.  Using `step_log()` to log-transform the numeric predictors `inpatient_beds`, `inpatient_beds_coverage`, and `inpatient_beds_used_covid`.
+
+2.  Putting the infrequently occurring values of `state_region` into an "Southwest_and_other" category using `step_other()` and one-hot encoded this categorical predictor using `step_dummy()`.
+
+3.  Applying `step_date()` to make `date` a numeric type variable and removing the original `date` column using `step_rm()`.
+
+4.  Centering and scaling all predictors using `step_center()` and `step_scale()`. 
+<br>
+
+### Model Tuning
+
+**Regular grids** with 5 levels of possible values for tuning hyper-parameters for each of the four models are used. 
+<br>
+
+#### Tuning Parameters and Range
+
+For the random forest model, I tuned the hyper-parameters `mtry` and `min_n`. For the boosted tree model, I tuned `mtry`, `min_n`, and `learn_rate`. For the *k*-nearest neighbors model, I tuned `neighbors`. For the elastic net regression model, I tuned `penalty` and `mixture`.
+<br>
+
+For `mtry`, the range is set to `range = c(1, 11)`. For `learn_rate`, I updated `range = c(-1, 0)`, representing a value from 0.1 to 1. The range of `neighbors` is set to be `c(1L, 25L)`. Default tuning parameters are used for parameters `min_n`, `mixture`, and `penalty`.
+
+### Model Tuning Results
+
+The best model is picked as the one having the optimal (lowest) RMSE value. Among the competing models, the random forest model (`rand_forest()`) with the `ranger` engine shows the lowest RMSE value with **optimal parameters `mtry` equals 8 and `min_n` equals 11**. Therefore, it was chosen to be the winning model. The model tuning results for the four competing models are shown by the tibbles below. The row showing the parameter set with the optimal RMSE values for each model is highlighted in blue. 
+```{r}
+covid_recipe <- 
+  recipe(critical_shortage_log ~ ., 
+         data = covid_train) %>% 
+  # log-transform all numeric predictors
+  step_log(c(inpatient_beds, inpatient_beds_coverage, 
+             inpatient_beds_used_covid), offset = 0.0000001) %>% 
+  step_other(state_region, threshold = 1000, 
+             other = "Southwest_and_other") %>% 
+  step_date(date, features = "doy") %>% 
+  step_rm(date) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>% 
+  # center and scale all predictors
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+
+# train and tune models
+# random forest model
+rf_model <- rand_forest(mode = "regression",
+                        min_n = tune(),
+                        mtry = tune()) %>% 
+  set_engine("ranger")
+
+# boosted tree model
+bt_model <- boost_tree(mode = "regression", 
+                       mtry = tune(), 
+                       min_n = tune(), 
+                       learn_rate = tune()) %>% 
+  set_engine("xgboost")
+
+# Nearest neighbors model
+nn_model <- nearest_neighbor(mode = "regression", 
+                             neighbors = tune()) %>% 
+  set_engine("kknn")
+
+# elastic net regression model
+elastic_net_reg_model <- linear_reg(penalty = tune(), 
+                                    mixture = tune()) %>% 
+  set_engine("glmnet")
+
+# random forest model
+rf_params <- parameters(rf_model) %>% 
+  update(mtry = mtry(range = c(1, 11)))
+# store regular grid
+rf_grid <- grid_regular(rf_params, levels = 5)
+
+# boosted tree model
+bt_params <- parameters(bt_model) %>% 
+  update(mtry = mtry(range = c(1, 11)), 
+         learn_rate = learn_rate(range = c(-1, 0)))
+# store regular grid
+bt_grid <- grid_regular(bt_params, levels = 5)
+
+# Nearest neighbors model
+nn_params <- parameters(nn_model) %>% 
+  update(neighbors = neighbors(range = c(1L, 25L)))
+# store regular grid
+nn_grid <- grid_regular(nn_params, levels = 5)
+
+# elastic net regression model
+elastic_net_params <- parameters(elastic_net_reg_model)
+# store regular grid
+elastic_net_grid <- grid_regular(elastic_net_params, levels = 5)
+
+# random forest model
+rf_workflow <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(covid_recipe)
+
+# boosted tree model
+bt_workflow <- workflow() %>% 
+  add_model(bt_model) %>% 
+  add_recipe(covid_recipe)
+
+# Nearest neighbors model
+nn_workflow <- workflow() %>% 
+  add_model(nn_model) %>% 
+  add_recipe(covid_recipe)
+
+# elastic net regression model
+elastic_net_workflow <- workflow() %>% 
+  add_model(elastic_net_reg_model) %>% 
+  add_recipe(covid_recipe)
+
+# read in results
+rf_tuned <- read_rds("results/rf_tune.rds")
+bt_tuned <- read_rds("results/bt_tune.rds")
+nn_tuned <- read_rds("results/nn_tune.rds")
+elastic_net_tuned <- read_rds("results/elastic_net_tune.rds")
+
+# show rmse and select parameters based on best numerical performance
+# random forest model
+show_best(rf_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for Random Forest Model")
+
+# boosted tree model
+show_best(bt_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for Boosted Tree Model")
+
+# nearest neighbors model
+show_best(nn_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for k-Nearest Neighbors Model")
+
+# elastic net regression model
+show_best(elastic_net_tuned, metric = "rmse") %>% 
+  select(-.config) %>%
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  row_spec(1, color = "white",
+              background = "blue") %>% 
+  kableExtra::footnote(general = "Tuning Result for Elastic Net Regression Model")
+```
+<br>
+
+As shown by the tibbles, the random forest model produced the smaller RMSE across cross-validation. Here, the mean RMSE value of the best tuning parameters combination for the random forest model is 0.783, which is the lowest among the 4 models. Also, the standard error of its RMSE value is 0.01593507, and the difference between the mean RMSE of the best tuning parameters combination of the random forest model and the second lowest mean RMSE (the RMSE of the boosted tree model) is 0.052. Since the standard error of the random forest model's RMSE is much smaller than its difference with the second lowest mean RMSE, the random forest model model shows significantly better performance in producing the lowest bias on average.
+
+### Interpreting Model Tuning Results
+
+The random forest model's supreme performance in comparison to the other models for the prediction problem might be associated with the nature of this model and several key features of the dataset explored: 
+
+1.  The original dataset contains many large outliers, and random forest is robust to outliers.
+
+2.  Some variables, in particular `date`, do not have a straight-linear relation with the outcome variable. Also, `date` does not have a direct linear relation with any other predictor variables. The non-linearity makes random forest a favorable model in comparison to the linear algorithms.
+
+3.  The predictor `state_region` is categorical while other predictor variables are continuous. Since random forest works well with both categorical and continuous variables, it shows good performance for the situation of this prediction problem. 
+
+### Fitting to Testing Set
+
+When fitting the model to the untouched testing dataset and transforming the predictions back to the original scale of the outcome variable, the RMSE value is 9.47, meaning that the average bias is about 9 hospitals. The r-squared value is 0.8225, indicating that about 82.25% of the variation in the outcome variable can be explained by the model. The mae value is 4.753, suggesting that the average absolute differences between prediction and actual observations is about 4 or 5 hospitals.
+```{r}
+rf_workflow_tuned <- rf_workflow %>% 
+  finalize_workflow(select_best(rf_tuned, metric = "rmse"))
+
+rf_results <- fit(rf_workflow_tuned, covid_train)
+
+# create metric set
+covid_metric <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                      yardstick::rsq)
+
+# show result of prediction on testing data
+predict(rf_results, new_data = covid_test) %>% 
+  # change the predicted value from log-scale to original scale
+  mutate(
+    new_pred = round(10 ^ .pred)
+  ) %>% 
+  bind_cols(covid_test %>% select(critical_shortage_log)) %>% 
+  # transform from log-scale back to original scale
+  mutate(truth_obs = round(10 ^ critical_shortage_log)) %>%
+  covid_metric(truth = truth_obs, estimate = new_pred) %>% 
+  kbl() %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+<br>
+
+The RMSE value is high, given the context that many true observations have values lower than 50. The high RMSE might due to the presence of large outliers. Considering the relatively high r-squared value (82.25%), the model's performance in making predictions using on test set is mildly satisfactory, since it successfully explains a large proportion of the variances in the response variable, despite having a relatively high bias. 
+
+# Conclusion
+
+In conclusion, the project focuses on a regression prediction problem aiming to predict the number of hospitals having a critical staffing shortage in a state on a specific day with information regarding the state's current situation of the medical system capacity and utilization of hospital resources. 
+<br>
+
+The EDA section discovered the near perfect direct linear relation among many independent variables and used it as a guidance for narrowing down the scope of predictors for modeling to avoid the potential problems caused collinearity. Also, the EDA section noted the right-skewness of the response variable and performed a log-transformation. 
+<br>
+
+The Predictive Modeling section used grid search for training and tuning four competing types of models. Among them, the random forest model (`rand_forest()`) with the `ranger` engine shows the lowest RMSE value with **optimal parameters `mtry` equals 8 and `min_n` equals 11**, and it was chosen to be the "winning model". When fitting to the testing set and comparing predictions and the actual values on the original scale (not log-transformed), the model showed a RMSE value of 9.47, a r-squared value of 0.8225, and a mae value is 4.753.
+
+# Future Steps
+
+Online documentation suggests that random forest can automatically handle missing values. However, for this project, all rows with `NA` values were removed in the EDA section before model tuning. Future studies can attempt to not drop the `NA` values and access different model's performance in processing missing values.  
+<br>
+
+Also, even though the dataset is a time-series, no obvious relation between `date` and any of the other variables in the dataset was observed. Thus, future studies can run the predictions without considering the effect of `date` and compare the two results. Modification in the modeling process involves using `initial_split()` instead of `initial_time_split()`. 
+<br>
+
+Another direction for future improvement/exploration is to use feature hashing in creating the recipe for encoding the 52 levels of the `state` variable instead of collapsing them into regions. It might be interesting to examine the potential differences in the models' performances when the categorical variable `state` is handled differently. 
+<br>
+
+Lastly, the original outcome variable before log-transformation,  `critical_staffing_shortage_today_yes`, is a count variable that takes only positive whole number values. However, it does not have a finite set of values and cannot be treated as a multi-level categorical variable. Online resources suggest that count variables are best predicted by the poisson regression model. However, since this type of model is not yet covered in class, the outcome variable is treated as a numeric variable in this project. For future challenges, it might be helpful to do the prediction with a poisson regression model and compare its performance with the other models covered in the project. 

@@ -1,0 +1,78 @@
+---
+title: "Codebook for covid_data.rds"
+author: "XI KANG"
+date: "3/17/2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## COVID-19 Related Patient Impact and Hospital Capacity by State Timeseries
+
+### Description
+
+#### Source Dataset
+
+The `covid_data.rds` data was obtained and modified from the dataset [**COVID-19 Reported Patient Impact and Hospital Capacity by State Timeseries**](https://healthdata.gov/Hospital/COVID-19-Reported-Patient-Impact-and-Hospital-Capa/g62h-syeh). The dataset is obtained from [Data.gov](https://www.data.gov). The raw source dataset contains information regaring the COVID-19 related patient impact and hospital utilization as state-specific timeseries from 2020-01-01 to 2021-02-27. The original unprocessed dataset has 60 columns and 16601 observations.
+<br>
+
+#### Current Processed Dataset
+
+The current processed dataset `covid_data.rds` contains 11183 rows, representing 11183 observations. It has 8 variables, among them, `state_region` is a categorical variable, `date` is a date variable, and the other 6 variables are numeric. Different from the original raw dataset, all observations in the processed dataset are in timeseries from 2020-08-01 to 2021-02-27. 
+
+### Format
+
+It is in ".rds" file format. When loading, it will convert to a data frame with columns. 
+
+<br>
+
+### Data Fields
+
+Column   | Description
+---------|---------------
+`state_region`| The geographic region of the state according to the classification guide on the [National Geographic's website](https://www.nationalgeographic.org/maps/united-states-regions/).
+`date`| Date of the report.
+`inpatient_beds`| The reported total number of staffed inpatient beds including all overflow and surge/expansion beds used for inpatients (includes all ICU beds) in this state on the given date.
+`inpatient_beds_utilization`| Percentage of inpatient beds that are being utilized in this state. 
+`adult_icu_bed_utilization`| Percentage of staffed adult ICU beds that are being utilized in this state. 
+`inpatient_beds_coverage`| Number of hospitals reporting "inpatient_beds" in this state.
+`inpatient_beds_used_covid`| Reported patients currently hospitalized in an inpatient bed who have suspected or confirmed COVID-19 in this state.
+`critical_shortage_log`| The number (on base-10 log scale) of hospitals reporting a critical staffing shortage on the given date in this state. This variable is the log-base-10-transformed version of the variable `critical_staffing_shortage_today_yes` in the original dataset. 
+
+<br>
+
+### Data Values
+
+**state_region**
+
+A categorical variable representing the geographical region of the state for which the report is obtained. Levels of the original `state` variable in the raw dataset were collapsed into levels of this `state_region` variable according to the common way of referring to regions in the United States by grouping them into 5 regions according to their geographic position on the continent (the Northeast, Southwest, West, Southeast, and Midwest). The way of classifying the regions is obtained on the [National Geographic's website](https://www.nationalgeographic.org/maps/united-states-regions/). The original `state` values "DC" (capital), "VI" (Virgin Islands), "PR" (Puerto Rico), and "HI" (Hawaii) are put into the `other` category. 
+
+**date**
+
+The date type variable in the international standard format `%Y-%m-%d`. Values range from 2020-08-01 to 2021-02-27. 
+
+**critical_shortage_log**
+
+The number (on base-10 log scale) of hospitals having a critical staffing shortage in the state. It is log-base-10-transformed from variable `critical_staffing_shortage_today_yes` in the raw dataset. Before the process of transformation, a small number 0.00000001 is added to every value of the original variable to avoid getting infinite values when taking the log of 0. The original variable `critical_staffing_shortage_today_yes` is a count number that has only non-negative integer values. The set of possible values for the original variable `critical_staffing_shortage_today_yes` is infinite. 
+
+**inpatient_beds_used_covid, inpatient_beds, inpatient_beds_coverage**
+
+The number of hopitalized patients with suspected or confirmed COVID-19, the total number of staffed inpatient beds, and the number of hospitals reporting `inpatient_beds`. These variables are count numbers that have only non-negative integer values. They do not have a finite set of possible values.
+
+**inpatient_beds_utilization, adult_icu_bed_utilization**
+
+The percentage values representing the proportion of inpatient beds occupied or the proportion of staffed ICU beds under utilization in the state. 
+
+
+### Source
+
+Source for obtaining the raw dataset: [**COVID-19 Reported Patient Impact and Hospital Capacity by State Timeseries**](https://healthdata.gov/Hospital/COVID-19-Reported-Patient-Impact-and-Hospital-Capa/g62h-syeh). 
+<br>
+
+Access to raw dataset API: https://dev.socrata.com/foundry/healthdata.gov/g62h-syeh
