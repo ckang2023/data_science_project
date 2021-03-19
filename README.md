@@ -10,11 +10,11 @@ This project focuses on data modeling and analysis of the [**COVID-19 Reported P
 Essential components of the project are: 
 <br>
 
-1.  A long form report (R Markdown file with knitted HTML file) that includes: 
-  a.  an introduction of the data and research question.
-  b.  an exploratory data analysis that is either motivated by the research question.
-  c.  attempts to fit a couple different models and evaluate each model's performance using cross-validation.
-  d.  debrief on the predictive modeling results and discussion on the future steps.
+1.  A long form report (R Markdown file with knitted HTML file) that includes: <br>
+  a.  an introduction of the data and research question.<br>
+  b.  an exploratory data analysis that is either motivated by the research question.<br>
+  c.  attempts to fit a couple different models and evaluate each model's performance using cross-validation.<br>
+  d.  debrief on the predictive modeling results and discussion on the future steps.<br>
 2.  An executive summary (R Markdown file with knitted HTML file) detailing the highlights of the data analysis and statistical learning process.
 3.  Several R-script files for running the codes for tuning the parameters of competing models.
 4.  A data subdirectory for the datasets used, which is divided into processed and unprocessed folders. The processed folder contains a codebook for the modified dataset.
